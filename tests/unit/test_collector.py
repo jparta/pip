@@ -6,7 +6,7 @@ import re
 import uuid
 from pathlib import Path
 from textwrap import dedent
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from unittest import mock
 
 import pytest
@@ -30,6 +30,7 @@ from pip._internal.models.index import PyPI
 from pip._internal.models.link import (
     Link,
     LinkHash,
+    MetadataFile,
     _clean_url_path,
     _ensure_quoted_url,
 )
@@ -485,13 +486,30 @@ def test_parse_links_json() -> None:
                     "requires-python": ">=3.7",
                     "dist-info-metadata": False,
                 },
-                # Same as above, but parsing dist-info-metadata.
+                # Same as above, but parsing core-metadata.
                 {
                     "filename": "holygrail-1.0-py3-none-any.whl",
                     "url": "/files/holygrail-1.0-py3-none-any.whl",
                     "hashes": {"sha256": "sha256 hash", "blake2b": "blake2b hash"},
                     "requires-python": ">=3.7",
-                    "dist-info-metadata": "sha512=aabdd41",
+                    "core-metadata": {"sha512": "aabdd41"},
+                },
+                # Ensure fallback to dist-info-metadata works
+                {
+                    "filename": "holygrail-1.0-py3-none-any.whl",
+                    "url": "/files/holygrail-1.0-py3-none-any.whl",
+                    "hashes": {"sha256": "sha256 hash", "blake2b": "blake2b hash"},
+                    "requires-python": ">=3.7",
+                    "dist-info-metadata": {"sha512": "aabdd41"},
+                },
+                # Ensure that core-metadata gets priority.
+                {
+                    "filename": "holygrail-1.0-py3-none-any.whl",
+                    "url": "/files/holygrail-1.0-py3-none-any.whl",
+                    "hashes": {"sha256": "sha256 hash", "blake2b": "blake2b hash"},
+                    "requires-python": ">=3.7",
+                    "core-metadata": {"sha512": "aabdd41"},
+                    "dist-info-metadata": {"sha512": "this_is_wrong"},
                 },
             ],
         }
@@ -527,7 +545,23 @@ def test_parse_links_json() -> None:
             requires_python=">=3.7",
             yanked_reason=None,
             hashes={"sha256": "sha256 hash", "blake2b": "blake2b hash"},
-            dist_info_metadata="sha512=aabdd41",
+            metadata_file_data=MetadataFile({"sha512": "aabdd41"}),
+        ),
+        Link(
+            "https://example.com/files/holygrail-1.0-py3-none-any.whl",
+            comes_from=page.url,
+            requires_python=">=3.7",
+            yanked_reason=None,
+            hashes={"sha256": "sha256 hash", "blake2b": "blake2b hash"},
+            metadata_file_data=MetadataFile({"sha512": "aabdd41"}),
+        ),
+        Link(
+            "https://example.com/files/holygrail-1.0-py3-none-any.whl",
+            comes_from=page.url,
+            requires_python=">=3.7",
+            yanked_reason=None,
+            hashes={"sha256": "sha256 hash", "blake2b": "blake2b hash"},
+            metadata_file_data=MetadataFile({"sha512": "aabdd41"}),
         ),
     ]
 
@@ -538,7 +572,7 @@ def test_parse_links_json() -> None:
         metadata_link.url
         == "https://example.com/files/holygrail-1.0-py3-none-any.whl.metadata"
     )
-    assert metadata_link.link_hash == LinkHash("sha512", "aabdd41")
+    assert metadata_link._hashes == {"sha512": "aabdd41"}
 
 
 @pytest.mark.parametrize(
@@ -575,41 +609,53 @@ _pkg1_requirement = Requirement("pkg1==1.0")
 
 
 @pytest.mark.parametrize(
-    "anchor_html, expected, link_hash",
+    "anchor_html, expected, hashes",
     [
         # Test not present.
         (
             '<a href="/pkg1-1.0.tar.gz"></a>',
             None,
-            None,
+            {},
         ),
         # Test with value "true".
         (
-            '<a href="/pkg1-1.0.tar.gz" data-dist-info-metadata="true"></a>',
-            "true",
-            None,
+            '<a href="/pkg1-1.0.tar.gz" data-core-metadata="true"></a>',
+            MetadataFile(None),
+            {},
         ),
         # Test with a provided hash value.
         (
-            '<a href="/pkg1-1.0.tar.gz" data-dist-info-metadata="sha256=aa113592bbe"></a>',  # noqa: E501
-            "sha256=aa113592bbe",
-            None,
+            '<a href="/pkg1-1.0.tar.gz" data-core-metadata="sha256=aa113592bbe"></a>',  # noqa: E501
+            MetadataFile({"sha256": "aa113592bbe"}),
+            {},
         ),
         # Test with a provided hash value for both the requirement as well as metadata.
         (
-            '<a href="/pkg1-1.0.tar.gz#sha512=abc132409cb" data-dist-info-metadata="sha256=aa113592bbe"></a>',  # noqa: E501
-            "sha256=aa113592bbe",
-            LinkHash("sha512", "abc132409cb"),
+            '<a href="/pkg1-1.0.tar.gz#sha512=abc132409cb" data-core-metadata="sha256=aa113592bbe"></a>',  # noqa: E501
+            MetadataFile({"sha256": "aa113592bbe"}),
+            {"sha512": "abc132409cb"},
+        ),
+        # Ensure the fallback to the old name works.
+        (
+            '<a href="/pkg1-1.0.tar.gz" data-dist-info-metadata="sha256=aa113592bbe"></a>',  # noqa: E501
+            MetadataFile({"sha256": "aa113592bbe"}),
+            {},
+        ),
+        # Ensure that the data-core-metadata name gets priority.
+        (
+            '<a href="/pkg1-1.0.tar.gz" data-core-metadata="sha256=aa113592bbe" data-dist-info-metadata="sha256=invalid_value"></a>',  # noqa: E501
+            MetadataFile({"sha256": "aa113592bbe"}),
+            {},
         ),
     ],
 )
-def test_parse_links__dist_info_metadata(
+def test_parse_links__metadata_file_data(
     anchor_html: str,
     expected: Optional[str],
-    link_hash: Optional[LinkHash],
+    hashes: Dict[str, str],
 ) -> None:
-    link = _test_parse_links_data_attribute(anchor_html, "dist_info_metadata", expected)
-    assert link.link_hash == link_hash
+    link = _test_parse_links_data_attribute(anchor_html, "metadata_file_data", expected)
+    assert link._hashes == hashes
 
 
 def test_parse_links_caches_same_page_by_url() -> None:
@@ -1014,6 +1060,7 @@ def test_link_collector_create_find_links_expansion(
     """
     Test "~" expansion in --find-links paths.
     """
+
     # This is a mock version of expanduser() that expands "~" to the tmpdir.
     def expand_path(path: str) -> str:
         if path.startswith("~/"):
@@ -1051,6 +1098,21 @@ def test_link_collector_create_find_links_expansion(
             LinkHash("sha256", "aa113592bbe"),
         ),
         (
+            "https://pypi.org/pip-18.0.tar.gz#sha256=aa113592bbe&subdirectory=setup",
+            LinkHash("sha256", "aa113592bbe"),
+        ),
+        (
+            "https://pypi.org/pip-18.0.tar.gz#subdirectory=setup&sha256=aa113592bbe",
+            LinkHash("sha256", "aa113592bbe"),
+        ),
+        # "xsha256" is not a valid algorithm, so we discard it.
+        ("https://pypi.org/pip-18.0.tar.gz#xsha256=aa113592bbe", None),
+        # Empty hash.
+        (
+            "https://pypi.org/pip-18.0.tar.gz#sha256=",
+            LinkHash("sha256", ""),
+        ),
+        (
             "https://pypi.org/pip-18.0.tar.gz#md5=aa113592bbe",
             LinkHash("md5", "aa113592bbe"),
         ),
@@ -1060,4 +1122,30 @@ def test_link_collector_create_find_links_expansion(
     ],
 )
 def test_link_hash_parsing(url: str, result: Optional[LinkHash]) -> None:
-    assert LinkHash.split_hash_name_and_value(url) == result
+    assert LinkHash.find_hash_url_fragment(url) == result
+
+
+@pytest.mark.parametrize(
+    "metadata_attrib, expected",
+    [
+        ("sha256=aa113592bbe", MetadataFile({"sha256": "aa113592bbe"})),
+        ("sha256=", MetadataFile({"sha256": ""})),
+        ("sha500=aa113592bbe", MetadataFile(None)),
+        ("true", MetadataFile(None)),
+        (None, None),
+        # Attribute is present but invalid
+        ("", MetadataFile(None)),
+        ("aa113592bbe", MetadataFile(None)),
+    ],
+)
+def test_metadata_file_info_parsing_html(
+    metadata_attrib: str, expected: Optional[MetadataFile]
+) -> None:
+    attribs: Dict[str, Optional[str]] = {
+        "href": "something",
+        "data-dist-info-metadata": metadata_attrib,
+    }
+    page_url = "dummy_for_comes_from"
+    base_url = "https://index.url/simple"
+    link = Link.from_element(attribs, page_url, base_url)
+    assert link is not None and link.metadata_file_data == expected
